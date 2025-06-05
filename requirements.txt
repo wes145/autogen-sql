@@ -1,0 +1,9 @@
+autogen-agentchat
+autogen-ext[openai]
+autogen-core
+playwright
+aiohttp
+aiofiles
+openai
+python-dotenv
+Scrapy
