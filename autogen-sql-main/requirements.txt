@@ -1,0 +1,14 @@
+autogen-agentchat
+autogen-ext[openai]
+autogen-core
+playwright
+aiohttp
+aiofiles
+openai
+python-dotenv
+scrapy
+arjun
+sslscan
+scrapy_playwright
+beautifulsoup4
+sqlmap
