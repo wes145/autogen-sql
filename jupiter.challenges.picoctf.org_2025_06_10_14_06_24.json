@@ -1,0 +1,23 @@
+[
+    {
+        "domain": "jupiter.challenges.picoctf.org",
+        "ip": [
+            "3.131.60.8"
+        ],
+        "http": [
+            301,
+            "https://jupiter.challenges.picoctf.org/",
+            "nginx/1.14.0 (Ubuntu)"
+        ],
+        "https": [
+            null,
+            null,
+            null
+        ],
+        "cert": [
+            null,
+            null,
+            null
+        ]
+    }
+]
