@@ -98,7 +98,7 @@ class SimpleRAG:
     def _initialize_components(self):
         """Initializes the LLM, Embeddings, and Text Splitter."""
         # Use OpenAI for both the LLM and embeddings (requires API key)
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+        self.llm = ChatOpenAI(model="text-embedding-3-large", temperature=0.2)
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         
         # Alternative: Use a free, local HuggingFace model for embeddings
@@ -126,8 +126,17 @@ class SimpleRAG:
         # Load vector store if it exists
         if os.path.exists(os.path.join(VECTOR_STORE_PATH, "index.faiss")):
             print("Loading existing vector store...")
-            self.vector_store = FAISS.load_local(VECTOR_STORE_PATH, self.embeddings)
-            print("Vector store loaded successfully")
+            try:
+                self.vector_store = FAISS.load_local(
+                    VECTOR_STORE_PATH, 
+                    self.embeddings,
+                    allow_dangerous_deserialization=True  # Only enable this if you trust the source of the vector store
+                )
+                print("Vector store loaded successfully")
+            except Exception as e:
+                print(f"Error loading vector store: {e}")
+                print("Creating new vector store...")
+                self.vector_store = None
         else:
             print(f"No existing vector store found at {VECTOR_STORE_PATH}")
             self.vector_store = None
@@ -135,9 +144,18 @@ class SimpleRAG:
     def _save_stores(self):
         """Saves the vector store and indexed URLs to disk."""
         if self.vector_store:
-            self.vector_store.save_local(VECTOR_STORE_PATH)
-        with open(INDEXED_URLS_PATH, 'wb') as f:
-            pickle.dump(self.indexed_urls, f)
+            try:
+                self.vector_store.save_local(VECTOR_STORE_PATH)
+                print(f"Vector store saved to {VECTOR_STORE_PATH}")
+            except Exception as e:
+                print(f"Error saving vector store: {e}")
+        
+        try:
+            with open(INDEXED_URLS_PATH, 'wb') as f:
+                pickle.dump(self.indexed_urls, f)
+            print(f"Indexed URLs saved to {INDEXED_URLS_PATH}")
+        except Exception as e:
+            print(f"Error saving indexed URLs: {e}")
 
     def build_rag_chain(self):
         """Loads data from new URLs, updates vector store, and builds the RAG chain."""
@@ -174,10 +192,21 @@ class SimpleRAG:
 
         # 5. Define the prompt for the RAG chain
         prompt_template = """
-        You are an assistant for question-answering tasks.
+        You are a cybersecurity expert assistant specializing in penetration testing and web security.
         Answer the following question based ONLY on the provided context.
-        If the answer is not in the context, say "I don't know based on the provided documents."
-        Be concise and helpful.
+        
+        IMPORTANT GUIDELINES:
+        - Focus on actionable, practical information
+        - Provide specific payloads, commands, or techniques when available
+        - If the question is about SQL injection, prioritize payload examples and testing methods
+        - If the question is about vulnerability testing, include specific tools and parameters
+        - Be precise and technical - avoid general explanations
+        - If the answer is not in the context, say "I don't have specific information about this in my knowledge base."
+        
+        Format your response as:
+        1. Direct answer to the question
+        2. Specific payloads/commands (if applicable)
+        3. Additional context or related techniques (if relevant)
 
         <context>
         {context}
@@ -187,15 +216,24 @@ class SimpleRAG:
         """
         prompt = ChatPromptTemplate.from_template(prompt_template)
         
-        # 6. Create the "stuff" chain (feeds documents to the LLM)
+        # 6. Create the "stuff" chain with enhanced retrieval
         question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
 
-        # 7. Create the retrieval chain
+        # 7. Create the retrieval chain with better search parameters
+        retriever = self.vector_store.as_retriever(
+            search_type="mmr",  # Maximum Marginal Relevance for diverse results
+            search_kwargs={
+                "k": 8,  # Retrieve more documents
+                "fetch_k": 20,  # Fetch more candidates for MMR
+                "lambda_mult": 0.7  # Balance between relevance and diversity
+            }
+        )
+        
         self.rag_chain = create_retrieval_chain(
-            self.vector_store.as_retriever(),
+            retriever,
             question_answer_chain
         )
-        print("RAG chain is ready to answer questions.")
+        print("Enhanced RAG chain is ready to answer questions.")
 
     def query(self, question: str) -> str:
         """

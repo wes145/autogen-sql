@@ -1,0 +1,18 @@
+flask==2.3.3
+flask-socketio==5.3.6
+python-socketio==5.9.0
+python-engineio==4.8.0
+eventlet==0.33.3
+# Dependencies from main project
+autogen-core
+autogen-agentchat
+autogen-ext
+langchain
+langchain-openai
+python-dotenv
+beautifulsoup4
+faiss-cpu
+sentence-transformers 
+wapiti3
+sslscan
+arjun

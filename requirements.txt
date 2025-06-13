@@ -8,3 +8,8 @@ openai
 python-dotenv
 Scrapy
 knockpy
+sqlmap
+wapiti3
+arjun
+requests
+#knockpy might give an error, but it is still installed

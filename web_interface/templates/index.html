@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLi Pentest Team</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/monokai-sublime.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        :root {
+            --primary-color: #2B6CB0;
+            --secondary-color: #4299E1;
+            --background-color: #1A202C;
+            --text-color: #F7FAFC;
+            --accent-color: #48BB78;
+            --error-color: #F56565;
+            --success-color: #48BB78;
+            --warning-color: #ECC94B;
+        }
+
+        body {
+            background-color: var(--background-color);
+            color: var(--text-color);
+        }
+
+        .chat-container {
+            height: calc(100vh - 180px);
+            background-color: rgba(26, 32, 44, 0.95);
+            border: 1px solid var(--secondary-color);
+            border-radius: 0.5rem;
+        }
+
+        .message {
+            margin: 10px 0;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .message:hover {
+            transform: translateX(5px);
+        }
+
+        .agent { 
+            background-color: var(--primary-color);
+            border-left: 4px solid var(--secondary-color);
+        }
+
+        .tool-call { 
+            background-color: var(--secondary-color);
+            border-left: 4px solid var(--accent-color);
+        }
+
+        .tool-result { 
+            background-color: rgba(66, 153, 225, 0.1);
+            border-left: 4px solid var(--warning-color);
+        }
+
+        .error { 
+            background-color: var(--error-color);
+            border-left: 4px solid #C53030;
+        }
+
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background-color: rgba(0, 0, 0, 0.2);
+            padding: 1rem;
+            border-radius: 0.5rem;
+        }
+
+        .command-output {
+            font-family: 'Fira Code', monospace;
+            background-color: rgba(0, 0, 0, 0.3);
+        }
+
+        .json {
+            background-color: rgba(0, 0, 0, 0.3);
+        }
+
+        .timestamp {
+            font-size: 0.8em;
+            color: var(--secondary-color);
+        }
+
+        .agent-name {
+            font-weight: bold;
+            color: var(--accent-color);
+        }
+
+        .tool-category {
+            background-color: rgba(66, 153, 225, 0.1);
+            border: 1px solid var(--secondary-color);
+            border-radius: 0.5rem;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .tool-category-title {
+            color: var(--accent-color);
+            font-weight: bold;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-select {
+            background-color: var(--background-color);
+            color: var(--text-color);
+            border: 1px solid var(--secondary-color);
+            border-radius: 0.25rem;
+            padding: 0.5rem;
+            width: 100%;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-select:focus {
+            outline: none;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 3px rgba(72, 187, 120, 0.2);
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-color);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background-color: #38A169;
+            transform: translateY(-1px);
+        }
+
+        .btn-danger {
+            background-color: var(--error-color);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background-color: #C53030;
+            transform: translateY(-1px);
+        }
+
+        .config-panel {
+            background-color: rgba(26, 32, 44, 0.95);
+            border: 1px solid var(--secondary-color);
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .input-field {
+            background-color: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--secondary-color);
+            border-radius: 0.25rem;
+            color: var(--text-color);
+            padding: 0.75rem;
+            width: 100%;
+            transition: all 0.3s ease;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 3px rgba(72, 187, 120, 0.2);
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <div class="container mx-auto p-4">
+        <h1 class="text-4xl font-bold mb-6 text-center text-accent-color">SQLi Pentest Team</h1>
+
+        <!-- Configuration Panel -->
+        <div class="config-panel">
+            <h2 class="text-2xl font-bold mb-4 text-accent-color">Configuration</h2>
+            <form id="config-form" class="space-y-6">
+                <div>
+                    <label class="block mb-2 font-medium text-lg">Target URLs (comma-separated)</label>
+                    <input id="urls" class="input-field" placeholder="https://example.com, https://test.com" />
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label class="block mb-2 font-medium">Planner Model</label>
+                        <select id="planner_model" class="input-field">
+                            <option value="gpt-4o-mini">gpt-4o-mini (Recommended)</option>
+                            <option value="gpt-4.1-nano">gpt-4.1-nano</option>
+                            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                            <option value="gpt-o3-mini">gpt-o3-mini</option>
+                            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label class="block mb-2 font-medium">Planner Prompt (optional override)</label>
+                        <textarea id="planner_prompt" rows="8" class="input-field"></textarea>
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">Selector Prompt (optional override)</label>
+                        <textarea id="selector_prompt" rows="8" class="input-field"></textarea>
+                    </div>
+                </div>
+
+                <!-- Tools section -->
+                <div>
+                    <label class="block mb-2 font-medium text-lg">Tool Selection</label>
+                    <div id="tools-container" class="space-y-4">
+                        <!-- Tool categories will be inserted here by JS -->
+                    </div>
+                </div>
+
+                <div class="flex gap-4 mt-4">
+                    <button id="start-btn" type="submit" class="btn btn-primary">Start Pentest</button>
+                    <button id="stop-btn" type="button" class="btn btn-danger" disabled>Stop Pentest</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Messages -->
+        <div id="messages" class="chat-container overflow-y-scroll p-4"></div>
+    </div>
+
+    <script>
+        // Socket.IO
+        const socket = io();
+        const messagesDiv = document.getElementById('messages');
+
+        socket.on('new_message', (data) => {
+            const msg = document.createElement('div');
+            msg.classList.add('message');
+            msg.innerHTML = `<span class="timestamp">[${data.timestamp}]</span> <span class="agent-name">${data.agent || ''}</span>: ${data.content}`;
+            if(data.type === 'tool_call') msg.classList.add('tool-call');
+            if(data.type === 'tool_result') msg.classList.add('tool-result');
+            if(data.type === 'error') msg.classList.add('error');
+            messagesDiv.appendChild(msg);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        });
+
+        // Pre-fill prompts with defaults from backend
+        fetch('/defaults').then(r => r.json()).then(def => {
+            document.getElementById('planner_prompt').value = def.planner_prompt || '';
+            document.getElementById('selector_prompt').value = def.selector_prompt || '';
+        });
+
+        // Fetch and display available tools
+        const toolsContainer = document.getElementById('tools-container');
+        fetch('/tools').then(r => r.json()).then(tools => {
+            // Group tools by category
+            const categories = {
+                "Reconnaissance": ["curl_headers_tool", "get_subdomains_tool", "knockpy_tool", "summarize_knockpy_tool"],
+                "Vulnerability Scanning": ["sqlmap_tool", "wapiti_tool", "read_wapiti_report_tool", "arjun_tool"],
+                "Directory Discovery": ["ffuf_tool"],
+                "Visual Analysis": ["aquatone_tool", "summarize_aquatone_tool"],
+                "Security Research": ["query_rag_function_tool", "google_search_tool", "security_sites_search_tool"]
+            };
+
+            // Create category sections
+            for (const [category, toolList] of Object.entries(categories)) {
+                const categoryDiv = document.createElement('div');
+                categoryDiv.className = 'tool-category';
+                
+                const title = document.createElement('div');
+                title.className = 'tool-category-title';
+                title.textContent = category;
+                categoryDiv.appendChild(title);
+
+                const select = document.createElement('select');
+                select.className = 'tool-select';
+                select.multiple = true;
+                select.size = 4;
+
+                // Add tools to select
+                toolList.forEach(tool => {
+                    if (tools.includes(tool)) {
+                        const option = document.createElement('option');
+                        option.value = tool;
+                        option.textContent = tool.replace('_tool', '').replace(/_/g, ' ');
+                        select.appendChild(option);
+                    }
+                });
+
+                categoryDiv.appendChild(select);
+                toolsContainer.appendChild(categoryDiv);
+            }
+        });
+
+        // Form submission
+        document.getElementById('config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('stop-btn').disabled = false;
+
+            const urls = document.getElementById('urls').value.split(',').map(url => url.trim()).filter(url => url);
+            if (!urls.length) {
+                alert('Please enter at least one URL');
+                document.getElementById('start-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
+                return;
+            }
+
+            // Get selected tools from all selects
+            const selectedTools = Array.from(document.querySelectorAll('.tool-select'))
+                .flatMap(select => Array.from(select.selectedOptions).map(option => option.value));
+
+            const body = {
+                urls,
+                planner_model: document.getElementById('planner_model').value,
+                web_model: 'gpt-4o-mini', // Always use gpt-4o-mini for web surfer
+                planner_prompt: document.getElementById('planner_prompt').value || undefined,
+                selector_prompt: document.getElementById('selector_prompt').value || undefined,
+                tools: selectedTools
+            };
+
+            try {
+                const res = await fetch('/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body)
+                });
+                if (!res.ok) {
+                    throw new Error('Failed to start pentest');
+                }
+            } catch (error) {
+                alert('Error starting pentest: ' + error.message);
+                document.getElementById('start-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
+            }
+        });
+
+        document.getElementById('stop-btn').addEventListener('click', async () => {
+            try {
+                await fetch('/stop', {method: 'POST'});
+                document.getElementById('start-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
+            } catch (error) {
+                alert('Error stopping pentest: ' + error.message);
+            }
+        });
+    </script>
+</body>
+</html> 

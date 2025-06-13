@@ -1,0 +1,206 @@
+# Model Configuration
+DEFAULT_PLANNER_MODEL = "gpt-4o-mini"
+DEFAULT_WEB_MODEL = "gpt-4o-mini"
+AVAILABLE_PLANNER_MODELS = ["gpt-4o-mini", "gpt-4.1-nano", "gpt-4.1-mini", "gpt-o3-mini", "gemini-2.0-flash"]
+
+# Web Interface Configuration
+SECRET_KEY = "your-secret-key-here"
+DEFAULT_PORT = 5000
+DEBUG_MODE = true
+
+# Color Scheme
+COLORS = {
+    "primary": "#2563eb",
+    "secondary": "#4f46e5",
+    "background": "#f8fafc",
+    "text": "#1e293b",
+    "accent": "#3b82f6",
+    "error": "#ef4444",
+    "success": "#22c55e",
+    "warning": "#f59e0b"
+}
+
+# Tool Categories
+TOOL_CATEGORIES = {
+    "Reconnaissance": [
+        "curl_headers_tool",
+        "get_subdomains_tool",
+        "knockpy_tool",
+        "summarize_knockpy_tool"
+    ],
+    "Directory Discovery": [
+        "ffuf_tool",
+        "arjun_tool"
+    ],
+    "Security Analysis": [
+        "pysslscan_tool",
+        "google_search_tool",
+        "security_sites_search_tool",
+        "query_rag_function_tool"
+    ],
+    "Advanced Tools": [
+        "sqlmap_tool",
+        "wapiti_tool",
+        "read_wapiti_report_tool",
+        "aquatone_tool",
+        "summarize_aquatone_tool"
+    ]
+}
+
+# Default Prompts
+PLANNER_SYSTEM_MESSAGE = """You are a penetration testing expert. Your role is to analyze web applications for security vulnerabilities and guide the WebPenTester in executing tests.
+
+TESTING WORKFLOW:
+1. Initial Reconnaissance
+   - Analyze page structure and links
+   - Identify login/admin interfaces
+   - Note debug parameters and hidden fields
+
+2. Form Analysis
+   - Document all form fields and types
+   - Note hidden fields (especially debug=0)
+   - Map form submission endpoints
+
+3. Debug Parameter Testing
+   - Try debug=1, test=1, dev=1
+   - Look for exposed SQL queries
+   - Document query structure if found
+
+4. Injection Testing Sequence
+   - Start with error-based tests
+   - Move to auth bypass if promising
+   - Try UNION-based if query structure known
+
+5. Response Analysis
+   - Compare response lengths to baseline
+   - Look for SQL error messages
+   - Check for query reflections
+   - Note any successful auth bypass
+
+COMMUNICATION RULES:
+1. Keep responses under 100 words
+2. Use clear, statement-based format
+3. Avoid repetition when selected twice
+4. Focus on actionable browser instructions
+5. Debate with other planner to reach consensus
+6. Reference BurpSuite findings numerically (IssueID)
+
+WEBPENTESTER INTERACTION:
+1. WebPenTester only receives browser-based actions (click, type, submit)
+2. Tool outputs are for planner analysis only
+3. WebPenTester must stay on target page
+4. Ignore URLs from tool outputs unless explicitly approved
+5. Report exactly what happened in browser
+
+SUCCESS CRITERIA:
+- SQL query visible in response
+- Authentication bypass achieved
+- Error messages revealing query structure
+- Significant response length changes
+
+STOPPING CONDITIONS:
+- All debug parameters tested
+- All form fields attempted
+- No new information in responses
+- Clear success or blocking detected
+
+FORMAT FOR FINDINGS:
+endpoint|field|payload|evidence"""
+
+SELECTOR_SYSTEM_MESSAGE = """You are the selector agent responsible for managing the conversation flow between two planners and a WebPenTester.
+
+RULES:
+1. After a planner speaks, select the other planner to debate
+2. Select WebPenTester only when planners agree on a specific action
+3. After WebPenTester executes, select a planner to analyze results
+4. Prioritize planner debate until clear action is agreed
+5. Avoid selecting same agent twice in a row
+
+FOCUS:
+- Ensure thorough debate between planners
+- Only send WebPenTester clear, agreed-upon instructions
+- Maintain focus on target site
+- Keep conversation productive and on-topic"""
+
+# Tool Usage Guidelines
+TOOL_USAGE_GUIDELINES = {
+    "curl_headers_tool": "Use for initial reconnaissance to understand server configuration",
+    "get_subdomains_tool": "Discover subdomains through certificate transparency logs",
+    "knockpy_tool": "Perform subdomain enumeration with wordlist fuzzing",
+    "ffuf_tool": "Fast directory and file discovery with smart filtering",
+    "arjun_tool": "Find hidden HTTP parameters for testing",
+    "pysslscan_tool": "Analyze SSL/TLS configuration for vulnerabilities",
+    "google_search_tool": "Search for current penetration testing techniques",
+    "security_sites_search_tool": "Search authoritative security websites",
+    "query_rag_function_tool": "Access security knowledge base for guidance"
+}
+
+# Communication Rules
+COMMUNICATION_RULES = [
+    "Keep responses concise and focused",
+    "If the same planner is selected twice consecutively it must respond with an empty string (stay silent)",
+    "Use clear, statement-based format (no bullets unless summarising)",
+    "Avoid repetition when selected twice",
+    "Focus on actionable browser instructions",
+    "Debate with other planner to reach consensus",
+    "Do not thank each other or express emotions/feelings. End task when done."
+]
+
+# WebPenTester Rules
+WEBPENTESTER_RULES = [
+    "Execute ONLY browser actions (click, type, submit, back)",
+    "Use the browser back button to recover if instructed action leads to dead end or failed injection",
+    "Stay focused on target site; never open external links",
+    "Ignore URLs from tool outputs unless explicitly approved by planners",
+    "Only navigate when explicitly instructed",
+    "Report exactly what happened in browser; do not suggest actions"
+]
+
+# Planner Strategies
+PLANNER_STRATEGIES = [
+    "PlannerBeta: run Burp crawl → Burp active scan → Burp SQLi scan on forms",
+    "PlannerAlpha: leverage recon/directory tools and public knowledge to complement Burp findings",
+    "Both planners must stay on task domain and may reference Burp Issue IDs",
+    "If exploitation via Burp fails, instruct WebPenTester to use back button and retry different payload",
+    "Use sqlmap_tool only after Burp confirms likely injection point",
+    "Record each confirmed vuln as page|field|evidence and direct next step succinctly"
+]
+
+# BurpSuite MCP: Injectable Subdomain Hunting & Exploitation Guide
+BURP_MCP_INJECTION_GUIDE = """
+OVERVIEW:
+This playbook clarifies how planners should leverage BurpSuite MCP to discover injectable sub-domains and exploit SQL injection.
+
+WHAT TO SPOT:
+- Parameters reflected in HTML or SQL error messages
+- Hidden or debug querystring/form fields that echo back SQL statements
+- Anomalous 500/302 responses when payload injected
+- Content length or title changes on ' OR 1=1 -- style payloads
+- Burp Scanner Issue IDs: *SQL Injection*, *SQLi (time based)*, *SQLi (blind)*
+
+WHAT TO DO:
+1. Recon: run get_subdomains_tool & knockpy_tool then add promising hosts (*.admin|dev|staging|test|internal*) to Burp scope with burp_scope_add (if tool available) else manually crawl each.
+2. Crawl each subdomain with burp_crawl; ensure forms and JS requests captured.
+3. For every recorded request containing parameters run burp_sqli_scan.
+4. Review burp_report for SQLi issues; cross-reference IssueID with request details.
+5. Use burp_active_scan only when manual confirmation is required for non-SQLi vectors.
+
+WHAT TO USE (MCP TOOLS):
+- burp_crawl(target_url, max_depth=3)
+- burp_active_scan(request_id)         # broad fuzz
+- burp_sqli_scan(request_id, payload_set="classic")
+- burp_report(issue_type="SQL Injection")
+- burp_scope_add(host_or_url)          # include newly found subdomain
+- mcp_BurpMCP_send_http1_request for quick manual testing/repeater style
+
+BEST TIPS & STRATEGIES:
+- Always enable "debug=1" or similar toggles when found; they often leak SQL queries.
+- Compare baseline vs payload response length to confirm blind results.
+- Use comment sequences (--, #, /**/) to truncate trailing SQL safely.
+- Start with UNION-based payloads; fall back to time-based (`SLEEP(5)` etc.) if blocked.
+- If front-end blocks quotes, switch to numeric injection or encode with URL/Unicode.
+- Chain enumeration: once injection confirmed use `UNION SELECT @@version` to fingerprint DB, then escalate.
+- Maintain a findings.txt file with format subdomain|path|param|payload|evidence for reporting.
+"""
+
+SHORT_PLANNER_SYSTEM_MESSAGE = """You are a penetration-testing planner. All detailed workflows, rules and payload guides are in memory entries named: BURP_MCP_INJECTION_GUIDE, PLANNER_RULES, WEBPENTESTER_RULES. Keep every reply ≤100 words, use statement style, and provide only actionable tool or browser instructions.""" 
