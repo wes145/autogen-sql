@@ -34,6 +34,7 @@ from state_tracking import PenTestState, SQLiTestState
 from state_persistence import load_state, save_state
 from test_sequences import TestManager
 from hashlib import md5
+from urllib.parse import urlparse
 
 def load_config():
     """Load configuration from config.txt file."""
@@ -102,22 +103,22 @@ if sys.platform == "win32":
 def get_user_inputs():
     print("=== Interactive SQLi Pentest CLI Tool ===")
     print("Choose AI model:")
-    print("1. gpt-4o-mini (Recommended)")
-    print("2. gpt-4.1-nano")
-    print("3. gpt-4.1-mini")
-    print("4. gpt-o3-mini")
+    print("1. o3-mini (Recommended)")
+    print("2. gpt-4.1-mini")
+    print("3. gpt-4o-mini")
+    print("4. gpt-4.1-nano")
     print("5. gemini-2.0-flash")
     
     model_choice = input("Please enter your choice (1-5): ").strip()
     model_map = {
-        "1": "gpt-4o-mini",
-        "2": "gpt-4.1-nano",
-        "3": "gpt-4.1-mini",
-        "4": "o3-mini",
+        "1": "o3-mini",
+        "2": "gpt-4.1-mini",
+        "3": "gpt-4o-mini",
+        "4": "gpt-4.1-nano",
         "5": "gemini-2.0-flash"
     }
     
-    model_name = model_map.get(model_choice, "gpt-4o-mini")
+    model_name = model_map.get(model_choice, "o3-mini")
     
     print("\nEnter one or more target URLs to test for SQL injection (comma-separated):")
     urls = input("Target URLs: ").strip()
@@ -135,9 +136,12 @@ def get_user_inputs():
     enabled_tools = list(TOOL_NAME_MAP.keys())
     
     if tool_choice != 'y':
-        # Remove advanced tools if not enabled
-        disabled_tools = ['sqlmap_tool', 'wapiti_tool', 'read_wapiti_report_tool', 
-                         'aquatone_tool', 'summarize_aquatone_tool']
+        # Remove advanced and high-token tools if not enabled
+        disabled_tools = [
+            'sqlmap_tool', 'wapiti_tool', 'read_wapiti_report_tool', 
+            'aquatone_tool', 'summarize_aquatone_tool',
+            'google_search_tool', 'security_sites_search_tool', 'query_rag_function_tool'
+        ]
         enabled_tools = [tool for tool in enabled_tools if tool not in disabled_tools]
     
     return url_list, model_name, enabled_tools
@@ -370,11 +374,34 @@ REMOVED_TOOLS = {"sqlmap_tool", "wapiti_tool", "read_wapiti_report_tool"}
 for t in REMOVED_TOOLS:
     TOOL_NAME_MAP.pop(t, None)
 
+# ------------- Safe retry wrapper for chat client -------------
+
+class RetryChatClient(OpenAIChatCompletionClient):
+    """Tries primary model first, falls back to gpt-4.1-mini on failure."""
+
+    def __init__(self, primary_model: str, fallback_model: str = "gpt-4.1-mini", **kwargs):
+        super().__init__(model=primary_model, **kwargs)
+        self._primary = primary_model
+        self._fallback = fallback_model
+
+    async def create(self, *args, **kwargs):  # type: ignore
+        try:
+            return await super().create(*args, **kwargs)
+        except Exception:
+            # Switch to fallback once
+            if self.model != self._fallback:
+                self.model = self._fallback
+                return await super().create(*args, **kwargs)
+            raise
+
 # --------------------------------------------------
 # Helper to obtain the correct model client based on model name prefix
 # --------------------------------------------------
 
 def get_model_client(model_name: str):
+    # Use retry wrapper only when primary is o3-mini
+    if model_name == "o3-mini":
+        return RetryChatClient(primary_model="o3-mini")
     return OpenAIChatCompletionClient(model=model_name)
 
 # Selector prompt for a three-agent team with two debating planners
@@ -394,9 +421,9 @@ async def run_pentest_team(
     target_urls: list[str],
     message_handler=None,
     cancel_event=None,
-    # Model customisation
-    planner_model: str = "gpt-4o-mini",
-    web_model: str = "gpt-4o-mini",
+    # Model customisation (defaults now use gpt-4.1-mini)
+    planner_model: str = "gpt-4.1-mini",
+    web_model: str = "gpt-4.1-mini",
     # Prompt overrides
     planner_prompt_override: str | None = None,
     selector_prompt_override: str | None = None,
@@ -444,19 +471,33 @@ async def run_pentest_team(
         # --- Load SQLi knowledge base ---
         sqli_knowledge = load_sqli_knowledge()
 
+        # --- Lightweight guide compression to save tokens ---
+        def _compress_guide(text: str, max_lines: int = 120) -> str:
+            """Return a condensed version of a lengthy guide by keeping only short or bullet lines."""
+            lines = [l.strip() for l in text.splitlines()]
+            kept: list[str] = []
+            for l in lines:
+                if not l:
+                    continue
+                if l.startswith(('-', '*', '#')) or len(l) <= 100:
+                    kept.append(l)
+                if len(kept) >= max_lines:
+                    break
+            return '\n'.join(kept)
+
         # ------------------ Shared long-term memory ------------------
         fundamental_memory = ListMemory()
         # Load SQLi guide (if present)
         if sqli_knowledge and not sqli_knowledge.startswith("[Error"):
             await fundamental_memory.add(
-                MemoryContent(content=sqli_knowledge, mime_type=MemoryMimeType.TEXT)
+                MemoryContent(content=_compress_guide(sqli_knowledge), mime_type=MemoryMimeType.TEXT)
             )
 
         # Load Burp MCP exploitation playbook from config if available
         burp_playbook = config.get("BURP_MCP_INJECTION_GUIDE")
         if burp_playbook:
             await fundamental_memory.add(
-                MemoryContent(content=burp_playbook, mime_type=MemoryMimeType.TEXT)
+                MemoryContent(content=_compress_guide(burp_playbook), mime_type=MemoryMimeType.TEXT)
             )
 
         # Add state tracking to memory
@@ -486,8 +527,28 @@ async def run_pentest_team(
         planner_alpha_tools = alpha_tools
 
         # --- Define the Debating Planner Agents ---
-        planner_sys_msg = planner_prompt_override or short_planner_sys_msg or planner_system_message
-        bounded_ctx = BufferedChatCompletionContext(buffer_size=6)
+        # ---------------- Prompt triplet ----------------
+        PERSISTENCE_REM = (
+            "You are an autonomous agent — continue until the task is fully solved; never yield early."
+        )
+        TOOL_REM = (
+            "If unsure about page content, DOM structure, or Burp data, call an appropriate TOOL instead of guessing."
+        )
+        PLAN_REM = (
+            "Plan briefly before each tool call, and reflect on results before deciding next action."
+        )
+        allowed_hosts = {urlparse(u).netloc for u in target_urls}
+        host_reminder = (
+            "\nALLOWED_HOSTS: " + ", ".join(sorted(allowed_hosts)) +
+            "\nAlways use one of these exact hosts in any manual HTTP request or Burp action. "
+            "Never invent or shorten domain names."
+        )
+
+        no_idle_rule = "If you did not call any tool in your previous turn, you MUST call an appropriate tool now; otherwise reply with an empty string."
+        planner_sys_msg = (
+            planner_prompt_override or short_planner_sys_msg or planner_system_message
+        ) + "\n" + PERSISTENCE_REM + "\n" + TOOL_REM + "\n" + PLAN_REM + "\n" + no_idle_rule + host_reminder
+        bounded_ctx = BufferedChatCompletionContext(buffer_size=4)
         planner_alpha = AssistantAgent(
             name="PlannerAlpha",
             model_client=planner_client,
@@ -495,6 +556,7 @@ async def run_pentest_team(
             model_context=bounded_ctx,
             tools=planner_alpha_tools,
             memory=[fundamental_memory],
+            reflect_on_tool_use=True,
         )
 
         planner_beta_msg = (
@@ -509,15 +571,25 @@ async def run_pentest_team(
             model_context=bounded_ctx,
             tools=planner_beta_tools,
             memory=[fundamental_memory],
+            reflect_on_tool_use=True,
         )
 
         # --- Web Surfer Agent ---
+        webpentester_rules_text = " ".join(webpentester_rules)
+        webpentester_sys_msg = (
+            "You control a real browser. "
+            "Act ONLY when explicitly instructed by planners. "
+            "After each action, respond with a single short line (<=25 words) describing exactly what you observed, prefixed with 'RESULT:'. "
+            + webpentester_rules_text
+        )
+
         web_pentester_agent = MultimodalWebSurfer(
             name="WebPenTester",
             model_client=web_client,
             start_page=target_urls[0] if target_urls else None,
             headless=False,
             use_ocr=True,
+
         )
 
         # --- Team Selector Prompt ---
@@ -528,8 +600,8 @@ async def run_pentest_team(
             [planner_alpha, planner_beta, web_pentester_agent],
             model_client=planner_client,
             termination_condition=termination,
-            selector_prompt=selector_prompt_final,
-            allow_repeated_speaker=True,
+            selector_prompt=selector_prompt_final + "\nRule 6: Never select WebPenTester unless the last two messages came from different planners who agreed on a single action.",
+            allow_repeated_speaker=False,
         )
 
         # --- Interactive Loop ---
@@ -554,9 +626,11 @@ async def run_pentest_team(
                 print(f"\n[Target] {url}")
 
             task_description = (
-                f"Pentest {url}. Focus on SQLi. Current phase: {pentest_state.current_phase}. "
-                f"Promising: {len(pentest_state.promising_endpoints)}, Confirmed: {len(pentest_state.confirmed_vulns)}. "
-                "Follow memory guides. Keep replies ≤100 words."
+                f"Pentest {url}. PRIMARY OBJECTIVE: find the login page (or any credential form) *inside* the supplied base URL and its sub-paths, then test it for SQL injection.\n"
+                "MANDATORY FIRST ACTION: load the root page, read the HTML, extract links/forms containing keywords like login, signin, auth, account, user, register. Stay on same domain & sub-path.\n"
+                "After locating the login form: enumerate its fields, craft SQLi payloads, and use BurpSuite MCP (burp_crawl ➜ burp_sqli_scan) to probe. Do NOT wander to parent paths or other hosts.\n"
+                f"Current phase: {pentest_state.current_phase}. Promising={len(pentest_state.promising_endpoints)} Confirmed={len(pentest_state.confirmed_vulns)}.\n"
+                "Replies ≤120 words; statement style."
             )
 
             try:
@@ -645,7 +719,7 @@ if __name__ == "__main__":
         try:
             target_urls, model_name, enabled_tools = get_user_inputs()
             selected_tools = [TOOL_NAME_MAP[name] for name in enabled_tools]
-            await run_pentest_team(target_urls, planner_model=model_name, tool_names=enabled_tools)
+            await run_pentest_team(target_urls, planner_model=model_name, web_model=model_name, tool_names=enabled_tools)
         except KeyboardInterrupt:
             print("\n\nKeyboard interrupt received. Cleaning up and exiting...")
             sys.exit(0)
