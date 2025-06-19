@@ -9,6 +9,45 @@ from PIL import Image
 from io import BytesIO
 import requests
 from typing import List, Dict, Any
+from urllib.parse import urljoin, urlparse
+import textwrap
+import time
+from autogen_core.tools import FunctionTool
+
+# Attempt to import BeautifulSoup lazily to avoid hard dependency errors in environments without bs4
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except ImportError:  # Fallback placeholder
+    BeautifulSoup = None  # type: ignore
+
+# Attempt to import OpenAI lazily to avoid hard dependency errors in environments without openai
+try:
+    import openai  # type: ignore
+    from openai import OpenAI
+    openai_client = OpenAI()
+except ImportError:
+    openai = None  # type: ignore
+    openai_client = None
+
+# ---------------- Token-tuned cache -----------------
+_RESPONSE_CACHE: dict[str, str] = {}
+
+def _cache_get(k: str):
+    return _RESPONSE_CACHE.get(k)
+
+def _cache_set(k: str, v: str):
+    # simple size guard
+    if len(_RESPONSE_CACHE) > 500:
+        _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
+    _RESPONSE_CACHE[k] = v
+
+# ---------------- Utility helpers -----------------
+
+def _truncate(text: str, limit: int = 1800) -> str:
+    """Return text truncated to `limit` chars with ellipsis note."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]..."
 
 def run_subprocess_with_timeout(cmd, timeout, capture_output=True):
     """Run a subprocess with proper interrupt handling"""
@@ -22,6 +61,10 @@ def run_subprocess_with_timeout(cmd, timeout, capture_output=True):
         
         try:
             stdout, stderr = process.communicate(timeout=timeout)
+            # Truncate large outputs to keep token usage modest
+            if capture_output:
+                stdout = _truncate(stdout)
+                stderr = _truncate(stderr)
             return process.returncode, stdout, stderr
         except subprocess.TimeoutExpired:
             process.kill()
@@ -37,14 +80,129 @@ def run_subprocess_with_timeout(cmd, timeout, capture_output=True):
             raise
         return 1, "", str(e)
 
-def run_curl_headers(url: str) -> str:
+# ----------------------- curl headers with cache ------------------------
+
+def run_curl_headers(
+    url: str,
+    method: str = "GET",
+    data: str | None = None,
+    headers: dict | None = None,
+) -> str:
+    """Fetch headers *and* body for a given URL.
+
+    SECURITY GUARD – *Recon only*
+    ---------------------------------
+    This helper **must never** be abused to fire SQL-injection payloads.  Before any
+    network call is made we therefore inspect the supplied *url*, *data*, and
+    *headers* for high-risk SQLi tokens (quotes, comments, UNION/SELECT/etc.).
+    If we find a match the request is rejected immediately and a warning string
+    is returned to the caller.  This prevents mis-configured agents from using
+    the lightweight curl endpoint for exploitation instead of discovery.
+
+    • For simple reconnaissance (GET, no data) we still issue a quick HEAD request for speed.
+    • For POST/other methods we send the full request so that response HTML is available for analysis.
+
+    Returns a concise summary including discovered links and forms, *or* a
+    blocking message if potentially malicious input is detected.
+    """
+
+    # ------------------------------------------------------
+    # 1.  SQL-injection payload detection / hard block
+    # ------------------------------------------------------
+    _sqli_patterns = [
+        r"'",               # single quote
+        r"\"",             # double quote
+        r"--",              # SQL comment
+        r";",               # statement delimiter
+        r"/\*",            # block comment start
+        r"union", r"select", r"insert", r"update", r"delete", r" or ", r" and ",
+    ]
+
+    def _contains_sqli(text: str | None) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(p in lowered for p in _sqli_patterns)
+
+    if _contains_sqli(url) or _contains_sqli(data) or any(_contains_sqli(k) or _contains_sqli(str(v)) for k, v in (headers or {}).items()):
+        return "[curl_headers_tool BLOCKED] Potential SQL-injection content detected – use Burp MCP tools instead."
+
+    # Build cache key so identical POST bodies aren't refetched repeatedly
+    cache_key = f"curl|{method}|{url}|{hash(data) if data else ''}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        returncode, stdout, stderr = run_subprocess_with_timeout(["curl", "-I", url], timeout=15)
-        if returncode != 0:
-            return f"[curl error] {stderr}"
-        return stdout
+        headers_out = ""
+        body_out = ""
+
+        # ---------------- Retrieve headers ----------------
+        if method.upper() == "GET" and data is None:
+            ret, headers_out, err = run_subprocess_with_timeout(["curl", "-I", url], timeout=15)
+            if ret != 0:
+                headers_out = err or "(curl -I failed)"
+        else:
+            # For non-GET we'll capture headers later with -i
+            headers_out = "(see combined output)"
+
+        # ---------------- Retrieve body (+ headers if needed) ----------------
+        cmd_body = ["curl", "-sL", "--max-filesize", "262144", "-X", method.upper(), url]
+        if headers:
+            for k, v in headers.items():
+                cmd_body += ["-H", f"{k}: {v}"]
+        if data is not None:
+            cmd_body += ["-d", data]
+        # Include headers in output so we can parse if headers_out blank
+        cmd_body.insert(1, "-i")  # after "curl"
+
+        ret2, combined_out, err2 = run_subprocess_with_timeout(cmd_body, timeout=25)
+        if ret2 != 0:
+            combined_out = err2 or ""
+
+        # Separate headers/body from combined output
+        if "\r\n\r\n" in combined_out:
+            headers_part, body_out = combined_out.split("\r\n\r\n", 1)
+            if not headers_out or headers_out.startswith("(see"):
+                headers_out = headers_part
+        else:
+            body_out = combined_out
+
+        links_summary = "No links found."
+        if body_out and BeautifulSoup is not None:
+            links = extract_links_from_html(body_out, base_url=url, same_domain=True)[:30]
+            if links:
+                links_summary = "Links (first {}):\n".format(len(links)) + "\n".join(links)
+
+        # Extract forms and field names for SQL-i reconnaissance
+        forms_summary = "No forms found."
+        try:
+            soup = BeautifulSoup(body_out, "html.parser") if BeautifulSoup else None
+            if soup:
+                forms_desc: list[str] = []
+                for idx, form in enumerate(soup.find_all("form")[:5], 1):
+                    action = form.get("action", "").strip()
+                    method_f = form.get("method", "GET").upper()
+                    inputs = []
+                    for inp in form.find_all("input"):
+                        name = inp.get("name") or inp.get("id") or "<unnamed>"
+                        inp_type = inp.get("type", "text")
+                        inputs.append(f"{name}:{inp_type}")
+                    forms_desc.append(f"Form {idx}: {method_f} {action} | Fields: {', '.join(inputs) if inputs else 'none'}")
+                if forms_desc:
+                    forms_summary = "Forms discovered:\n" + "\n".join(forms_desc)
+        except Exception:
+            forms_summary = "[form extraction error]"
+
+        result = (
+            "=== RESPONSE HEADERS ===\n" + _truncate(headers_out, 600) +
+            "\n\n=== EXTRACTED LINKS ===\n" + _truncate(links_summary, 600) +
+            "\n\n=== EXTRACTED FORMS ===\n" + _truncate(forms_summary, 800)
+        )
+        _cache_set(cache_key, result)
+        return result
     except subprocess.TimeoutExpired:
-        return f"[curl error] Timed out after 15 seconds"
+        return f"[curl error] Timed out after 25 seconds"
     except KeyboardInterrupt:
         raise
     except Exception as e:
@@ -661,3 +819,457 @@ def search_security_sites(query: str, num_results: int = 3) -> str:
         return f"No results found across security sites for: {query}"
     
     return '\n'.join(all_results)
+
+def extract_links_from_html(html: str, base_url: str = None, same_domain: bool = True) -> List[str]:
+    """Parse the supplied HTML and return a list of fully-qualified links.
+
+    Args:
+        html: Raw HTML text to parse.
+        base_url: Optional base URL used to resolve relative links with urljoin.
+        same_domain: If True (default) keep only links that share the same netloc as base_url.
+
+    Returns:
+        Sorted list of unique URLs discovered in <a href="…"> elements.
+        If bs4 is not installed, returns an explanatory string embedded in a list.
+    """
+    if BeautifulSoup is None:
+        return ["[extract_links_from_html error] BeautifulSoup (bs4) not installed"]
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        links: set[str] = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            # Skip empty, anchor, mailto, javascript links
+            if not href or href.startswith("#") or href.lower().startswith("javascript:") or href.lower().startswith("mailto:"):
+                continue
+            full_url = urljoin(base_url, href) if base_url else href
+            if same_domain and base_url:
+                try:
+                    if urlparse(full_url).netloc != urlparse(base_url).netloc:
+                        continue
+                except Exception:
+                    pass
+            links.add(full_url)
+        return sorted(links)
+    except Exception as e:
+        return [f"[extract_links_from_html error] {e}"]
+
+# ---------------------------------------------------------------------------
+#  Log Summariser (stand-alone, optional)
+# ---------------------------------------------------------------------------
+
+def summarise_log(raw: str, max_lines: int = 120, max_chars: int = 1500) -> str:
+    """Return a short RESULT line and truncated preview of a long scanner log.
+
+    This is a lightweight fallback that works without LLMs; replace with an
+    LLM-powered summariser by swapping out this function. Keep the same
+    signature so callers don't break.
+    """
+    if not raw:
+        return "RESULT: (empty log)"
+
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    preview = "\n".join(lines[:max_lines])
+    preview = _truncate(preview, max_chars)
+    return f"RESULT: summarised log ({len(raw)} chars original)\n" + preview
+
+# ------------------ LLM-powered log summariser ------------------
+
+def summarise_log_llm(raw: str, model: str = "gpt-3.5-turbo", max_tokens: int = 256) -> str:
+    """Summarise log via OpenAI ChatCompletion. Falls back to summarise_log() if
+    OpenAI package or API key missing. Function kept separate from default
+    agent team; import and use on demand."""
+
+    if openai is None or not os.getenv("OPENAI_API_KEY"):
+        return summarise_log(raw)
+
+    if not raw:
+        return "RESULT: (empty log)"
+
+    prompt = textwrap.dedent(
+        f"""
+        You are a penetration-testing assistant. Summarise the following scanner log in <=120 words.
+        After the prose summary, output a JSON object on a new line with keys `urls` and `params` listing any newly
+        discovered URLs or HTTP parameters. If none, use empty arrays.
+        Log follows:
+        ---
+        {raw[:4000]}
+        ---
+        """
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        return "RESULT: " + content
+    except Exception as e:
+        return summarise_log(raw[:1500]) + f"\n[LLM summariser error: {e}]"
+
+def summarise_http_response(raw: str, max_header_chars: int = 600, max_body_chars: int = 1000, url: str = "") -> str:
+    """Return concise summary of an HTTP response using LLM analysis for HTML content.
+
+    • Keeps status line & headers (truncated)
+    • Uses LLM to analyze HTML body for security-relevant information
+    • Falls back to manual extraction if LLM unavailable
+    """
+    if not isinstance(raw, str):
+        return raw
+
+    # Split headers vs body
+    header_part, body_part = "", ""
+    if "\r\n\r\n" in raw:
+        header_part, body_part = raw.split("\r\n\r\n", 1)
+    elif "\n\n" in raw:
+        header_part, body_part = raw.split("\n\n", 1)
+    else:
+        lines = raw.splitlines()
+        header_part = "\n".join(lines[:20])
+        body_part = "\n".join(lines[20:])
+
+    # Fallback: if header_part empty but we have HTTP/ status somewhere inside, attempt to extract
+    if not header_part:
+        import re
+        m = re.search(r"HTTP/\d\.\d \d{3} [A-Za-z ]+", raw)
+        if m:
+            header_part = m.group(0)
+
+    # If still nothing useful, just return a notice
+    if not header_part and not body_part:
+        return "[summarise_http_response] Empty or unparseable response."
+
+    header_part = _truncate(header_part.strip(), max_header_chars)
+
+    body_analysis = ""
+    html_like = body_part and ("<html" in body_part.lower() or "<form" in body_part.lower() or "<!doctype" in body_part.lower())
+
+    if html_like:
+        # Attempt structured extraction first
+        body_analysis = summarize_html_with_llm(body_part, url)
+        # Also include raw preview so explicit success / welcome text isn't lost
+        body_analysis += "\n\n=== RAW BODY PREVIEW ===\n" + _truncate(body_part.strip(), max_body_chars)
+    else:
+        body_analysis = "=== BODY PREVIEW ===\n" + _truncate(body_part.strip(), max_body_chars)
+
+    return (
+        "=== RESPONSE HEADERS ===\n" + header_part +
+        "\n\n" + body_analysis
+    )
+
+# ------------------- Burp MCP response extractor -------------------
+
+def parse_burp_response(raw_burp_output: str) -> str:
+    """Extract the raw HTTP response portion from Burp MCP's HttpRequestResponse blob.
+
+    The MCP returns a Java-style string such as::
+
+        HttpRequestResponse{httpRequest=GET /index HTTP/1.1\r\nHost: ex.com..., httpResponse=HTTP/1.1 302 Found\r\n..., messageAnnotations=...}
+
+    This helper pulls out the substring that starts after ``httpResponse=`` and ends just before ``messageAnnotations`` (or the closing brace).  It also converts escaped CR/LF sequences so that standard HTTP-parsing utilities work.
+    """
+
+    if not raw_burp_output or not isinstance(raw_burp_output, str):
+        return str(raw_burp_output)
+
+    import re, json, html
+
+    # If wrapped in JSON list/dict (common with MCP tools), unwrap first
+    if raw_burp_output.lstrip().startswith("["):
+        try:
+            data = json.loads(raw_burp_output)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                raw_burp_output = data[0].get("text", raw_burp_output)
+        except Exception:
+            pass
+
+    # Regex to capture between httpResponse= ... , messageAnnotations or end brace
+    m = re.search(r"httpResponse=(.*?)(?:,\s*messageAnnotations=|}$)", raw_burp_output, re.DOTALL)
+    if m:
+        http_resp = m.group(1)
+    else:
+        # Fallback – maybe entire string is already the HTTP response.
+        http_resp = raw_burp_output
+
+    # Unescape common escape sequences
+    http_resp = http_resp.replace("\\r\\n", "\r\n").replace("\\n", "\n")
+    http_resp = html.unescape(http_resp)
+
+    return http_resp.strip()
+
+# ----------------------- Arjun summariser -----------------------
+
+def summarise_arjun_output(raw: str, keep_words: int = 30) -> str:
+    """Return only the last `keep_words` words of Arjun output for brevity."""
+    if not raw:
+        return "(empty Arjun output)"
+    # collapse newlines to spaces, split, keep last words
+    words = raw.replace("\n", " ").split()
+    snippet = " ".join(words[-keep_words:])
+    return _truncate(snippet, 500)
+
+# ----------------- Quick SQLi payload helper -----------------
+
+ADMIN_BYPASS_PAYLOADS = [
+    "' OR '1'='1' -- ",
+    "' OR 1=1 -- ",
+    "admin' -- ",
+    "admin' #",
+    "admin' OR '1'='1",
+    "' OR '1'='1' /*",
+    "' OR 1=1#",
+    "' OR 1=1/*",
+    "admin"" --",
+    "admin"" OR ""1""=""1",
+]
+
+def bypasspayloads(count: int = 10, format_type: str = "json") -> str:
+    """Return up to <count> classic admin-login SQL-injection payloads.
+    
+    Args:
+        count: Number of payloads to return (1-10)
+        format_type: Output format - "json" for JSON array, "text" for line-separated
+    """
+    count = max(1, min(count, len(ADMIN_BYPASS_PAYLOADS)))
+    payloads = ADMIN_BYPASS_PAYLOADS[:count]
+    
+    if format_type.lower() == "json":
+        import json
+        return json.dumps(payloads, indent=2)
+    else:
+        return "\n".join(payloads)
+
+# ---------------- LLM-powered HTML summarizer -----------------
+
+def summarize_html_with_llm(html_content: str, url: str = "") -> str:
+    """Summarize HTML content using a cheap LLM model to extract key pentesting information."""
+    if not openai_client or not html_content:
+        return _extract_html_manually(html_content)
+    
+    # Truncate HTML if too long to save on input tokens
+    if len(html_content) > 8000:
+        html_content = html_content[:8000] + "...[truncated]"
+    
+    prompt = f"""Analyze this HTML page for penetration testing. Extract ONLY the key information:
+
+1. FORMS: List each form with action, method, and input field names
+2. LINKS: List interesting links (login, admin, api, etc.)
+3. ERRORS: Any error messages or debug info
+4. TECH: Technology stack indicators (frameworks, versions)
+5. PARAMS: URL parameters or hidden fields
+
+Be concise. Focus on security-relevant elements only.
+
+URL: {url}
+HTML:
+{html_content}"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",  # Cheap model
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.1
+        )
+        
+        summary = response.choices[0].message.content.strip()
+        return f"=== LLM HTML ANALYSIS ===\n{summary}"
+        
+    except Exception as e:
+        # Fallback to manual extraction
+        return f"[LLM summarizer failed: {e}]\n{_extract_html_manually(html_content)}"
+
+def _extract_html_manually(html_content: str) -> str:
+    """Manual HTML extraction as fallback when LLM is unavailable."""
+    if not BeautifulSoup or not html_content:
+        return "No HTML content or BeautifulSoup unavailable"
+    
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        summary = ["=== MANUAL HTML ANALYSIS ==="]
+        
+        # Extract forms
+        forms = soup.find_all("form")
+        if forms:
+            summary.append("\nFORMS:")
+            for i, form in enumerate(forms[:3]):  # Limit to 3 forms
+                action = form.get("action", "")
+                method = form.get("method", "GET").upper()
+                inputs = [inp.get("name", f"unnamed_{inp.get('type', 'text')}") 
+                         for inp in form.find_all("input") if inp.get("name")]
+                summary.append(f"  Form {i+1}: {method} {action} - Fields: {', '.join(inputs)}")
+        
+        # Extract interesting links
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if any(keyword in href.lower() for keyword in ["login", "admin", "api", "auth", "signin"]):
+                links.append(href)
+        if links:
+            summary.append(f"\nINTERESTING LINKS: {', '.join(links[:5])}")
+        
+        # Look for error messages
+        error_indicators = soup.find_all(string=lambda text: text and any(
+            word in text.lower() for word in ["error", "exception", "debug", "sql", "mysql"]
+        ))
+        if error_indicators:
+            summary.append(f"\nERROR INDICATORS: {len(error_indicators)} found")
+        
+        # Technology indicators
+        tech_indicators = []
+        if soup.find("meta", {"name": "generator"}):
+            tech_indicators.append(soup.find("meta", {"name": "generator"}).get("content", ""))
+        for script in soup.find_all("script", src=True):
+            src = script["src"]
+            if any(tech in src.lower() for tech in ["jquery", "bootstrap", "angular", "react", "vue"]):
+                tech_indicators.append(src.split("/")[-1])
+        if tech_indicators:
+            summary.append(f"\nTECH STACK: {', '.join(tech_indicators[:3])}")
+        
+        return "\n".join(summary)
+        
+    except Exception as e:
+        return f"Manual HTML extraction failed: {e}"
+
+# ---------------- Parameterised SQLi probe -----------------
+#temporarily disabled
+SUCCESS_KEYWORDS = [
+    "log in", "logged in", "welcome", "dashboard", "admin", "flag", "congratulations", "you are now", "logout"]
+ERROR_KEYWORDS = [
+    "sql", "syntax", "warning", "error", "mysql", "odbc", "sqlite", "pg_", "near", "unclosed quotation", "unterminated","failed"]
+
+
+def sqli_probe(
+        url: str,
+        method: str = "POST",
+        params: list[str] | None = None,
+        payloads: list[str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 15,
+        blind_delay: float = 5.0,
+) -> str:
+    """Heuristic SQL-injection tester.
+
+    The caller supplies a list of *payloads*; the function injects each payload
+    into each parameter one-at-a-time, compares the response to a baseline and
+    flags anomalies (status change, length delta, SQL error text, time delay,
+    or obvious login success keywords).
+    """
+    if payloads is None:
+        return "[sqli_probe] No payloads provided"
+
+    sess = requests.Session()
+    if headers is None:
+        headers = {}
+
+    # Derive param names if not supplied
+    if params is None or not params:
+        parsed = urlparse(url)
+        qs_params = [p.split("=")[0] for p in parsed.query.split("&") if "=" in p]
+        params = qs_params or ["username", "password"]
+
+    # baseline
+    data_blank = {p: "" for p in params}
+    try:
+        base_resp = sess.request(method.upper(), url, data=data_blank if method.upper() == "POST" else None,
+                                 headers=headers, timeout=timeout, verify=False)
+    except Exception as e:
+        return f"[sqli_probe] baseline request failed: {e}"
+
+    base_len = len(base_resp.text)
+    base_status = base_resp.status_code
+
+    findings: list[str] = []
+    for p in params:
+        vuln = False
+        evidence = ""
+        for pl in payloads:
+            inj_data = data_blank.copy()
+            inj_data[p] = pl
+            start = time.monotonic()
+            try:
+                r = sess.request(method.upper(), url, data=inj_data if method.upper() == "POST" else None,
+                                  headers=headers, timeout=timeout+blind_delay, verify=False)
+            except Exception as e:
+                findings.append(f"{p}: request error {e}")
+                continue
+            delta_t = time.monotonic() - start
+            diff_len = abs(len(r.text) - base_len)
+            status_change = r.status_code != base_status
+            error_hit = any(k in r.text.lower() for k in ERROR_KEYWORDS)
+            success_hit = any(k in r.text.lower() for k in SUCCESS_KEYWORDS)
+            slow = delta_t > blind_delay
+            if status_change or diff_len > 30 or error_hit or slow or success_hit:
+                evidence_parts = []
+                if status_change:
+                    evidence_parts.append(f"status {base_status}->{r.status_code}")
+                if diff_len > 30:
+                    evidence_parts.append(f"len {base_len}->{len(r.text)}")
+                if error_hit:
+                    evidence_parts.append("SQL-error keyword")
+                if success_hit:
+                    evidence_parts.append("login-indicator keyword")
+                if slow:
+                    evidence_parts.append(f"delay {delta_t:.1f}s")
+
+                evidence_str = '; '.join(evidence_parts)
+
+                if success_hit:
+                    findings.append(f"LOGIN_BYPASS {p}: {evidence_str} | payload={pl[:30]}")
+                else:
+                    findings.append(f"LIKELY_VULN {p}: {evidence_str} | payload={pl[:30]}")
+                vuln = True
+                break  # stop further payloads for this param
+        if not vuln:
+            findings.append(f"CLEAN {p}: no anomalies across {len(payloads)} payloads")
+
+    summary = [
+        "=== SQLI PROBE REPORT ===",
+        f"Target: {method.upper()} {url}",
+        *findings
+    ]
+    return "\n".join(summary)
+
+sqli_probe_tool = FunctionTool(
+    sqli_probe,
+    name="sqli_probe_tool",
+    description="Heuristic SQLi tester. Provide params and payloads list; returns LIKELY_VULN lines when anomalies detected."
+)
+
+# ---------------- Report Writing Tool -----------------
+
+def writereport(filename: str, content: str) -> str:
+    """Write a penetration testing report to a text file.
+    
+    Args:
+        filename: Name of the file to create (without .txt extension)
+        content: The full report content to write
+    
+    Returns:
+        Success message with file path or error message
+    """
+    try:
+        # Ensure filename has .txt extension
+        if not filename.endswith('.txt'):
+            filename += '.txt'
+        
+        # Sanitize filename to prevent path traversal
+        filename = os.path.basename(filename)
+        
+        # Write the report
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        # Get absolute path for confirmation
+        abs_path = os.path.abspath(filename)
+        
+        return f"Report successfully written to: {abs_path}"
+        
+    except Exception as e:
+        return f"[writereport error] Failed to write report: {e}"
+

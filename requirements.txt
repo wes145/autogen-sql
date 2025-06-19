@@ -13,3 +13,6 @@ wapiti3
 arjun
 requests
 #knockpy might give an error, but it is still installed
+beautifulsoup4
+autogen-contextplus>=0.1.0
+fastapi==0.110.0
